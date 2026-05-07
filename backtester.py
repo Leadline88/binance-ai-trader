@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import logging
+import torch
 from typing import Dict, Any
 from model import TradingLSTM, ModelTrainer
 from indicators import TechnicalIndicators
@@ -11,25 +12,24 @@ class Backtester:
     def __init__(self, initial_capital: float = 10000.0, fee_rate: float = 0.0004, 
                  slippage: float = 0.0001, risk_per_trade: float = 0.01):
         self.initial_capital = initial_capital
-        self.fee_rate = fee_rate  # ~0.04% for futures maker/taker avg
+        self.fee_rate = fee_rate
         self.slippage = slippage
         self.risk_per_trade = risk_per_trade
         
     def calculate_sharpe_ratio(self, returns: np.ndarray, risk_free_rate: float = 0.0, 
                                periods_per_year: int = 365) -> float:
-        """Correct Sharpe ratio calculation for crypto (24/7 market)"""
         if len(returns) < 2:
             return 0.0
         
         returns = np.asarray(returns)
-        returns = returns[~np.isnan(returns)]  # remove NaNs
+        returns = returns[~np.isnan(returns)]
         
         if len(returns) < 2 or np.std(returns) == 0:
             return 0.0
         
         excess_returns = returns - (risk_free_rate / periods_per_year)
         mean_excess = np.mean(excess_returns)
-        std_dev = np.std(excess_returns, ddof=1)  # sample std
+        std_dev = np.std(excess_returns, ddof=1)
         
         if std_dev < 1e-10:
             return 0.0
@@ -39,7 +39,6 @@ class Backtester:
     
     def calculate_sortino_ratio(self, returns: np.ndarray, risk_free_rate: float = 0.0,
                                 periods_per_year: int = 365) -> float:
-        """Sortino: only downside deviation"""
         if len(returns) < 2:
             return 0.0
         returns = np.asarray(returns)
@@ -55,7 +54,6 @@ class Backtester:
         return (mean_excess / downside_std) * np.sqrt(periods_per_year)
     
     def calculate_max_drawdown(self, equity_curve: np.ndarray) -> float:
-        """Max drawdown in percent"""
         if len(equity_curve) < 2:
             return 0.0
         peak = np.maximum.accumulate(equity_curve)
@@ -63,7 +61,6 @@ class Backtester:
         return float(np.min(drawdown) * 100)
     
     def calculate_calmar_ratio(self, returns: np.ndarray, equity: np.ndarray) -> float:
-        """Calmar = CAGR / MaxDD"""
         if len(returns) < 2:
             return 0.0
         total_return = (equity[-1] / equity[0]) - 1
@@ -74,71 +71,79 @@ class Backtester:
     
     def run_backtest(self, df: pd.DataFrame, model: TradingLSTM, seq_len: int, 
                      feature_cols: list, initial_capital: float = None) -> Dict[str, Any]:
-        """Run walk-forward style backtest with AI signals"""
         if initial_capital is None:
             initial_capital = self.initial_capital
             
         df = df.copy().reset_index(drop=True)
         capital = initial_capital
-        position = 0.0  # in base asset (BTC etc)
+        position = 0.0
         entry_price = 0.0
         equity_curve = [capital]
         trades = []
         daily_returns = []
         
-        trainer = ModelTrainer(model)  # for prediction only
+        # === CRITICAL FIX: Global normalization like in training ===
+        feature_array = df[feature_cols].values.astype(np.float32)
+        global_mean = np.mean(feature_array, axis=0)
+        global_std = np.std(feature_array, axis=0) + 1e-8
+        logger.info(f"Global normalization applied. Features: {len(feature_cols)}")
+        
+        trainer = ModelTrainer(model)  # for prediction
         
         for i in range(seq_len, len(df) - 1):
             current_price = df.loc[i, 'close']
+            # Get raw features for this window
             features = df.loc[i-seq_len:i-1, feature_cols].values.astype(np.float32)
             
-            # Normalize like in training (simple, in real use better scaler)
-            feat_mean = features.mean(axis=0)
-            feat_std = features.std(axis=0) + 1e-8
-            features_norm = (features - feat_mean) / feat_std
+            # Use GLOBAL normalization (most important fix!)
+            features_norm = (features - global_mean) / global_std
             
             x = torch.tensor(features_norm, dtype=torch.float32).unsqueeze(0)
-            pred_return = trainer.model.predict(x[0]) if hasattr(trainer.model, 'predict') else 0.0
             
-            # Signal logic with risk management
+            # Get prediction
+            try:
+                pred_return = trainer.model.predict(x[0])  # x[0] because predict unsqueezes again
+            except Exception as e:
+                logger.warning(f"Prediction error at step {i}: {e}")
+                pred_return = 0.0
+            
+            # More reasonable thresholds
             signal = 0
-            if pred_return > 0.005 and position == 0:  # strong buy
+            if pred_return > 0.002 and position <= 0:   # Long signal
                 signal = 1
-            elif pred_return < -0.005 and position > 0:  # strong sell
+            elif pred_return < -0.002 and position > 0:  # Exit long
                 signal = -1
             
-            # Execute
+            # === Trade execution ===
             if signal == 1 and capital > 10:
-                # Risk based position size (simplified % of capital)
                 risk_amount = capital * self.risk_per_trade
-                position_size = risk_amount / current_price  # approx, ignore stop for backtest
+                position_size = risk_amount / current_price
                 cost = position_size * current_price * (1 + self.fee_rate + self.slippage)
                 if cost <= capital:
                     capital -= cost
-                    position += position_size
+                    position = position_size
                     entry_price = current_price
                     trades.append({'type': 'BUY', 'price': current_price, 'size': position_size, 'time': i})
             
             elif signal == -1 and position > 0:
-                # Sell all
                 sell_value = position * current_price * (1 - self.fee_rate - self.slippage)
                 capital += sell_value
-                trades.append({'type': 'SELL', 'price': current_price, 'size': position, 'time': i, 'pnl': (current_price - entry_price) * position})
+                pnl = (current_price - entry_price) * position
+                trades.append({'type': 'SELL', 'price': current_price, 'size': position, 'time': i, 'pnl': pnl})
                 position = 0.0
             
-            # Update equity (mark to market)
+            # Mark-to-market equity
             current_equity = capital + position * current_price
             equity_curve.append(current_equity)
             
-            # Daily return approx (for metrics)
             if len(equity_curve) > 1:
                 daily_returns.append((equity_curve[-1] / equity_curve[-2]) - 1)
         
-        # Final close if position open
+        # Close open position
         if position > 0:
             final_price = df.iloc[-1]['close']
             sell_value = position * final_price * (1 - self.fee_rate)
-            capital = capital + sell_value
+            capital += sell_value
             equity_curve[-1] = capital
         
         equity_curve = np.array(equity_curve)
@@ -151,8 +156,8 @@ class Backtester:
         
         win_rate = 0.0
         if trades:
-            profitable = sum(1 for t in trades if t.get('pnl', 0) > 0)
-            win_rate = profitable / len([t for t in trades if 'pnl' in t]) if any('pnl' in t for t in trades) else 0.5
+            profitable_trades = [t for t in trades if t.get('pnl', 0) > 0]
+            win_rate = len(profitable_trades) / len([t for t in trades if 'pnl' in t]) if any('pnl' in t for t in trades) else 0.5
         
         results = {
             'final_capital': capital,
@@ -164,16 +169,14 @@ class Backtester:
             'win_rate': win_rate,
             'num_trades': len(trades),
             'equity_curve': equity_curve.tolist(),
-            'trades': trades[-5:] if trades else []  # last 5 for summary
+            'trades': trades[-5:] if trades else []
         }
         
-        logger.info(f"Backtest completed: Sharpe={sharpe:.2f}, Return={results['total_return_pct']:.1f}%, MaxDD={max_dd:.1f}%")
+        logger.info(f"Backtest completed: Sharpe={sharpe:.2f}, Return={results['total_return_pct']:.1f}%, MaxDD={max_dd:.1f}%, Trades={len(trades)}")
         return results
 
 
 class Validator:
-    """Validates model performance - FIXED the -4 Sharpe bug here"""
-    
     def __init__(self, min_sharpe: float = 0.8, max_dd: float = 25.0, min_trades: int = 20):
         self.min_sharpe = min_sharpe
         self.max_dd = max_dd
@@ -191,12 +194,11 @@ class Validator:
         if max_dd > self.max_dd:
             errors.append(f"Max Drawdown too high: {max_dd:.1f}% > {self.max_dd}%")
         if num_trades < self.min_trades:
-            errors.append(f"Too few trades for reliable validation: {num_trades} < {self.min_trades}")
+            errors.append(f"Too few trades: {num_trades} < {self.min_trades}")
         
         if errors:
             error_msg = " | ".join(errors)
             logger.error(f"Validation FAILED: {error_msg}")
-            # NO hardcoded -4 anymore! Proper error instead of magic number
             raise ValueError(f"Model validation failed: {error_msg}")
         
         logger.info(f"Validation PASSED: Sharpe={sharpe:.2f}, MaxDD={max_dd:.1f}%, Trades={num_trades}")
